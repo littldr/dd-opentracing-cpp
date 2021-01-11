@@ -1,0 +1,10 @@
+FROM ubuntu:18.04
+
+RUN apt-get update && \
+  apt-get install -y openjdk-8-jre wget
+# Get Wiremock
+RUN wget https://repo1.maven.org/maven2/com/github/tomakehurst/wiremock-standalone/2.18.0/wiremock-standalone-2.18.0.jar -O wiremock-standalone-2.18.0.jar
+RUN printf '#!/bin/bash\nset -x\njava -jar '"$(pwd)/wiremock-standalone-2.18.0.jar \"\$@\"\n" > /usr/local/bin/wiremock && \
+  chmod a+x /usr/local/bin/wiremock
+
+CMD ["/bin/sh", "-c", "wiremock --port $WIREMOCK_PORT >/dev/null 2>&1"]

@@ -4,3 +4,17 @@ services:
     build:
       context: ../../..
       dockerfile: test/integration/nginx/Dockerfile
+
+  agentmock:
+    build:
+      context: ../../..
+      dockerfile: test/integration/nginx/Dockerfile.wiremock
+    environment:
+      WIREMOCK_PORT: 8126
+
+  httpmock:
+    build:
+      context: ../../..
+      dockerfile: test/integration/nginx/Dockerfile.wiremock
+    environment:
+      WIREMOCK_PORT: 8080

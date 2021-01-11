@@ -7,12 +7,7 @@ ARG OPENTRACING_NGINX_VERSION=0.8.0
 FROM ubuntu:18.04 as nginx-testbed
 
 RUN apt-get update && \
-  apt-get install -y git gnupg lsb-release wget curl tar openjdk-8-jre golang jq iproute2
-
-# Get Wiremock
-RUN wget https://repo1.maven.org/maven2/com/github/tomakehurst/wiremock-standalone/2.18.0/wiremock-standalone-2.18.0.jar -O wiremock-standalone-2.18.0.jar
-RUN printf '#!/bin/bash\nset -x\njava -jar '"$(pwd)/wiremock-standalone-2.18.0.jar \"\$@\"\n" > /usr/local/bin/wiremock && \
-  chmod a+x /usr/local/bin/wiremock
+  apt-get install -y git gnupg lsb-release wget curl tar golang jq iproute2 netcat
 
 ARG NGINX_VERSION
 

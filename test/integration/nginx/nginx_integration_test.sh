@@ -1,8 +1,8 @@
 #!/bin/bash
 # Runs nginx integration test.
-# Prerequisites: 
+# Prerequisites:
 #  * nginx and datadog tracing module installed.
-#  * Java, Golang 
+#  * Java, Golang
 # Run this test from the Docker container or CircleCI.
 
 NGINX_CONF_PATH=$(nginx -V 2>&1 | grep "configure arguments" | sed -n 's/.*--conf-path=\([^ ]*\).*/\1/p')
@@ -14,7 +14,10 @@ NGINX_ERROR_LOG=$(nginx -V 2>&1 | grep "configure arguments" | sed -n 's/.*--err
 function reset_test() {
   kill $NGINX_PID
   wait $NGINX_PID
-  pkill -x java # Kill wiremock
+  curl -X POST -s $WIREMOCK_AGENT_URL/__admin/reset
+  curl -X DELETE -s $WIREMOCK_AGENT_URL/__admin/requests
+  curl -X POST -s $WIREMOCK_HTTP_URL/__admin/reset
+  curl -X DELETE -s $WIREMOCK_HTTP_URL/__admin/requests
   echo ${NGINX_CONF} > ${NGINX_CONF_PATH}
   echo ${TRACER_CONF} > ${TRACER_CONF_PATH}
   echo "" > /tmp/curl_log.txt
@@ -31,9 +34,9 @@ function get_n_traces() {
   do
     sleep 1
     echo "" > ~/requests.json
-    REQUESTS=$(curl -s http://localhost:8126/__admin/requests)
-    echo "${REQUESTS}" | jq -r '.requests[].request.bodyAsBase64' | while read line; 
-    do 
+    REQUESTS=$(curl -s $WIREMOCK_AGENT_URL/__admin/requests)
+    echo "${REQUESTS}" | jq -r '.requests[].request.bodyAsBase64' | while read line;
+    do
       echo $line | base64 -d > ~/requests.bin; /root/go/bin/msgpack-cli decode ~/requests.bin | jq . >> ~/requests.json;
     done;
     # Merge 1 or more agent requests back into a single list of traces.
@@ -44,7 +47,7 @@ function get_n_traces() {
   STRIP_QUERY='del(.[] | .[] | .start, .duration, .span_id, .trace_id, .parent_id) | del(.[] | .[] | .meta | ."http_user_agent", ."peer.address", ."nginx.worker_pid", ."http.host")'
   cat ~/got.json | jq -rS "${STRIP_QUERY}"
   # Reset request log.
-  curl -X POST -s http://localhost:8126/__admin/requests/reset > /dev/null
+  curl -X POST -s $WIREMOCK_AGENT_URL/__admin/requests/reset > /dev/null
 }
 
 function wait_for_port() {
@@ -52,11 +55,17 @@ function wait_for_port() {
     return
   fi
 
+  local port=$2
+  local host=$1
+  if [ "$2" == "" ]; then
+    port=$1
+    host="localhost"
+  fi
+
   for ((i=0; i<60; i++)); do
     # Check at 0.25s intervals
     sleep 0.25
-    output=$(ss -ntlp sport eq :"$1" | tail -n +2)
-    if [ -n "$output" ]; then
+    if nc -z $host $port; then
       # It's listening now.
       return 0
     fi
@@ -71,13 +80,19 @@ function run_nginx() {
   wait_for_port 80
 }
 
-# TEST 1: Ensure the right traces sent to the agent.
-# Start wiremock in background
-wiremock --port 8126 >/dev/null 2>&1 &
-# Wait for wiremock to start
-wait_for_port 8126
+# Wait for wiremock agent to start
+wait_for_port agentmock 8126
+WIREMOCK_AGENT_URL=http://agentmock:8126
+
+# Wait for wiremock http to start
+wait_for_port httpmock 8080
+WIREMOCK_HTTP_URL=http://httpmock:8080
+
+reset_test
+
+# TEST 1: Ensure the right traces sent to the agent
 # Set wiremock to respond to trace requests
-curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "OK" }}' http://localhost:8126/__admin/mappings/new
+curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "OK" }}' $WIREMOCK_AGENT_URL/__admin/mappings/new
 
 # Send requests to nginx
 run_nginx
@@ -136,17 +151,15 @@ fi
 
 reset_test
 # Test 4: Check that priority sampling works.
-# Start the mock agent
-wiremock --port 8126 >/dev/null 2>&1 & wait_for_port 8126
-curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "{\"rate_by_service\":{\"service:nginx,env:prod\":0.5, \"service:nginx,env:\":0.2, \"service:wrong,env:\":0.1, \"service:nginx,env:wrong\":0.9}}" }}' http://localhost:8126/__admin/mappings/new
-# Start a HTTP server to receive distributed traces.
-wiremock --port 8080 >/dev/null 2>&1 & wait_for_port 8080
-curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "Hello World" }}' http://localhost:8080/__admin/mappings/new
+# Set wiremock to respond to trace requests
+curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "{\"rate_by_service\":{\"service:nginx,env:prod\":0.5, \"service:nginx,env:\":0.2, \"service:wrong,env:\":0.1, \"service:nginx,env:wrong\":0.9}}" }}' $WIREMOCK_AGENT_URL/__admin/mappings/new
+
+curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "Hello World" }}' $WIREMOCK_HTTP_URL/__admin/mappings/new
 
 echo '{
   "service": "nginx",
   "operation_name_override": "nginx.handle",
-  "agent_host": "localhost",
+  "agent_host": "agentmock",
   "agent_port": 8126,
   "sampling_rules": [],
   "environment": "prod"
@@ -172,7 +185,7 @@ then
 fi
 
 # Check the priority sampling was propagated for distributed traces.
-PROP_RATE=$(curl -s http://localhost:8080/__admin/requests | jq -r '[.requests[].request.headers."x-datadog-sampling-priority" | tonumber] | add/length')
+PROP_RATE=$(curl -s $WIREMOCK_HTTP_URL/__admin/requests | jq -r '[.requests[].request.headers."x-datadog-sampling-priority" | tonumber] | add/length')
 if [ $RATE != $PROP_RATE ]
 then
   echo "Test 4 failed: propagated sample rate should be $RATE but was $PROP_RATE"
@@ -188,14 +201,10 @@ fi
 
 reset_test
 # Test 5: Ensure that NGINX errors are reported to Datadog
-wiremock --port 8126 >/dev/null 2>&1 &
-# Wait for wiremock to start
-wait_for_port 8126
 # Set wiremock to respond to trace requests
-curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "OK" }}' http://localhost:8126/__admin/mappings/new
+curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "OK" }}' $WIREMOCK_AGENT_URL/__admin/mappings/new
 # Start a proxied server to receive distributed traces.
-wiremock --port 8080 >/dev/null 2>&1 & wait_for_port 8080
-curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 500, "body": "This is the sad face" }}' http://localhost:8080/__admin/mappings/new
+curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 500, "body": "This is the sad face" }}' $WIREMOCK_HTTP_URL/__admin/mappings/new
 run_nginx
 
 curl -s localhost/get_error/ 1> /tmp/curl_log.txt
@@ -212,10 +221,10 @@ fi
 reset_test
 
 # Test 6: Origin header is propagated and adds a tag
-wiremock --port 8126 >/dev/null 2>&1 & wait_for_port 8126
-curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "OK" }}' http://localhost:8126/__admin/mappings/new
-wiremock --port 8080 >/dev/null 2>&1 & wait_for_port 8080
-curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "Hello World" }}' http://localhost:8080/__admin/mappings/new
+# Set wiremock to respond to trace requests
+curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "OK" }}' $WIREMOCK_AGENT_URL/__admin/mappings/new
+
+curl -s -X POST --data '{ "priority":10, "request": { "method": "ANY", "urlPattern": ".*" }, "response": { "status": 200, "body": "Hello World" }}' $WIREMOCK_HTTP_URL/__admin/mappings/new
 
 run_nginx
 
@@ -226,7 +235,7 @@ curl_flags=(
   -H "x-datadog-origin: synthetics"
 )
 curl -s "${curl_flags[@]}" localhost/proxy/?1 1> /tmp/curl_log.txt
-ORIGIN_HEADER=$(curl -s http://localhost:8080/__admin/requests | jq -r '.requests[].request.headers."x-datadog-origin" == "synthetics"')
+ORIGIN_HEADER=$(curl -s $WIREMOCK_HTTP_URL/__admin/requests | jq -r '.requests[].request.headers."x-datadog-origin" == "synthetics"')
 if [ $ORIGIN_HEADER != "true" ]; then
   echo "Origin header not propagated"
   exit 1
